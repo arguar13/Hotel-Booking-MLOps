@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  namespace: hotel-mlops
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mlflow
+  template:
+    metadata:
+      labels:
+        app: mlflow
+    spec:
+      serviceAccountName: mlflow-sa
+      containers:
+        - name: mlflow
+          # The official image (no custom Dockerfile.mlflow to build/push).
+          # Kept in lockstep with the mlflow client pinned in api/ and
+          # core_ml/'s poetry.lock - a 2.x server with a 3.x client is not a
+          # supported combination.
+          image: ghcr.io/mlflow/mlflow:v3.15.2
+          # Using the unmodified upstream image keeps this deployment free of
+          # an extra image to build and publish, at a cost: it does not
+          # bundle the Postgres/S3 drivers, so this installs them at
+          # container start instead. That is also why this container does
+          # NOT run with readOnlyRootFilesystem (see the securityContext
+          # below) - `pip install` needs to write into the image's own
+          # site-packages. A production setup would trade that for a small
+          # custom image built with those drivers baked in, to avoid paying
+          # this install on every pod start and to restore the read-only
+          # root filesystem.
+          command: ["sh", "-c"]
+          args:
+            - |
+              pip install --no-cache-dir psycopg2-binary boto3 && \
+              mlflow server \
+                --backend-store-uri=postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(POSTGRES_DB) \
+                --default-artifact-root=s3://$(S3_BUCKET_NAME)/mlflow \
+                --allowed-hosts=$(MLFLOW_ALLOWED_HOSTS) \
+                --host=0.0.0.0 \
+                --port=5000
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+          # mlflow server is mostly a thin proxy over Postgres/S3, so this is
+          # request-shaped rather than compute-shaped; the limit exists to cap
+          # a single misbehaving upload rather than because steady-state usage
+          # is expected to approach it.
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          ports:
+            - containerPort: 5000
+          envFrom:
+            - secretRef:
+                name: mlops-secrets
+            - configMapRef:
+                name: mlops-config
+          readinessProbe:
+            tcpSocket:
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+---
+# ClusterIP, not LoadBalancer: the MLflow server has no authentication, and
+# anyone who can reach it can read every run and move the registry alias the
+# API serves from. Its only consumers are inside the cluster (api, the
+# drift-check CronJob) or an operator who already holds cluster credentials:
+#
+#   kubectl port-forward -n hotel-mlops svc/mlflow-service 5000:5000
+#   # UI: http://localhost:5000, or MLFLOW_TRACKING_URI=http://localhost:5000
+#
+# localhost:5000 is already on MLFLOW_ALLOWED_HOSTS, so no ELB hostname has to
+# be discovered and added after every re-deploy either.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow-service
+  namespace: hotel-mlops
+spec:
+  selector:
+    app: mlflow
+  ports:
+    - port: 5000
+      targetPort: 5000
+  type: ClusterIP
+---
+# mlflow server itself is stateless - state lives in Postgres and S3 - so two
+# replicas behind the same Service is a supported HA pattern with no
+# leader-election story to build. Without a PDB, a single voluntary
+# disruption (a node drain during an EKS upgrade, a Karpenter consolidation)
+# can evict both replicas in the same window and take the model registry -
+# and therefore api's startup and the drift monitor's baseline lookup - down
+# with it.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mlflow-pdb
+  namespace: hotel-mlops
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: mlflow

@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard
+  namespace: hotel-mlops
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dashboard
+  template:
+    metadata:
+      labels:
+        app: dashboard
+    spec:
+      # UID 1000 is the `appuser` baked into the image (see Dockerfile.dashboard).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dashboard
+          image: hotel-mlops-dashboard:local
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Streamlit rendering a handful of charts against api-service's
+          # responses - the lightest workload in this repo by a wide margin.
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "300m"
+              memory: "256Mi"
+          ports:
+            - containerPort: 8501
+          env:
+            - name: API_URL
+              value: "http://api-service.hotel-mlops.svc.cluster.local:8000"
+          # Read-only root filesystem: Streamlit writes its config and run
+          # state under $HOME (/home/appuser, set in Dockerfile.dashboard).
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: home
+              mountPath: /home/appuser
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: home
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashboard-service
+  namespace: hotel-mlops
+spec:
+  selector:
+    app: dashboard
+  ports:
+    - port: 8501
+      targetPort: 8501
+  type: LoadBalancer
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: dashboard-pdb
+  namespace: hotel-mlops
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: dashboard

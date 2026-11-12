@@ -1,0 +1,152 @@
+stages:
+  - lint_test
+  - build_push
+  - deploy
+  - train
+
+variables:
+  AWS_REGION: "us-east-1"
+  ECR_REPOSITORY_API: "hotel-mlops-api"
+  ECR_REPOSITORY_DASHBOARD: "hotel-mlops-dashboard"
+  # Batch image (Dockerfile.jobs): core_ml packaged to run inside the cluster.
+  # The drift-check CronJob runs from it, and this job's own `train` stage
+  # uses the same code (installed via Poetry, not this image) to retrain.
+  ECR_REPOSITORY_JOBS: "hotel-mlops-jobs"
+  EKS_CLUSTER_NAME: "hotel-mlops-cluster"
+  # AWS_ACCOUNT_ID is a protected/masked project CI/CD variable (Settings >
+  # CI/CD > Variables), not a literal here.
+  AWS_ROLE_ARN: "arn:aws:iam::$AWS_ACCOUNT_ID:role/hotel-mlops-gitlab-ci"
+  AWS_WEB_IDENTITY_TOKEN_FILE: "/tmp/web_identity_token"
+
+# OIDC authentication with AWS: GitLab issues GITLAB_OIDC_TOKEN, which this
+# writes to a file boto3/aws-cli pick up automatically to assume
+# AWS_ROLE_ARN - no static AWS keys stored in GitLab.
+.aws_auth: &aws_auth
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: sts.amazonaws.com
+  before_script:
+    - |
+      if [ -n "$GITLAB_OIDC_TOKEN" ]; then
+        echo "$GITLAB_OIDC_TOKEN" > $AWS_WEB_IDENTITY_TOKEN_FILE
+      fi
+
+# The Makefile is the single interface for quality gates: the exact same
+# `make` targets run here and on a developer's machine, so there is only one
+# place that defines "how to lint/test".
+lint_test:
+  stage: lint_test
+  image: python:3.12-slim
+  script:
+    - apt-get update && apt-get install -y --no-install-recommends make curl git
+    - curl -sSL https://install.python-poetry.org | python3 -
+    - export PATH="/root/.local/bin:$PATH"
+    - poetry -C api install --no-interaction
+    - poetry -C core_ml install --no-interaction
+    - make lint
+    - make test
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
+
+build_push:
+  stage: build_push
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  <<: *aws_auth
+  script:
+    - apk add --no-cache aws-cli
+    - |
+      for i in $(seq 1 90); do
+        docker info >/dev/null 2>&1 && break
+        sleep 1
+      done
+      docker info >/dev/null 2>&1 || (echo "dockerd never became reachable" && exit 1)
+    - export ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+    - export IMAGE_TAG=$CI_COMMIT_SHA
+    - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+
+    - docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY_API:latest -f Dockerfile .
+    - docker push -a $ECR_REGISTRY/$ECR_REPOSITORY_API
+
+    - >
+      docker build
+      -t $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:$IMAGE_TAG
+      -t $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:latest
+      -f Dockerfile.dashboard .
+    - docker push -a $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD
+
+    # MLflow itself is not built here: kubernetes/base/mlflow.yaml runs the
+    # official ghcr.io/mlflow/mlflow image directly.
+    - docker build --build-arg GIT_COMMIT_SHA=$CI_COMMIT_SHA -t $ECR_REGISTRY/$ECR_REPOSITORY_JOBS:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY_JOBS:latest -f Dockerfile.jobs .
+    - docker push -a $ECR_REGISTRY/$ECR_REPOSITORY_JOBS
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
+
+# Deploys straight to the cluster with kubectl/kustomize - no GitOps
+# controller in between. Simpler to follow end to end for a small team, at
+# the cost of the cluster's actual state only being provably "what Git says"
+# right after this job runs, not continuously reconciled.
+deploy:
+  stage: deploy
+  image: python:3.12-slim
+  <<: *aws_auth
+  script:
+    - apt-get update && apt-get install -y --no-install-recommends curl unzip
+    - curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz" | tar xz -C /usr/local/bin
+    - curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip && unzip -q awscliv2.zip && ./aws/install
+    - curl -sL "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
+    - aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
+    - export ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+    - export IMAGE_TAG=$CI_COMMIT_SHA
+    - cd kubernetes/overlays/production
+    - kustomize edit set image hotel-mlops-api=$ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG
+    - kustomize edit set image hotel-mlops-dashboard=$ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:$IMAGE_TAG
+    - kustomize edit set image hotel-mlops-jobs=$ECR_REGISTRY/$ECR_REPOSITORY_JOBS:$IMAGE_TAG
+    - kubectl apply -k .
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
+
+# Manual only: retrains, runs the quality gate (train.py) and, if the
+# candidate clears it, canary-compares it against the current champion and
+# promotes it (promote_model.py). Nothing here runs automatically - a human
+# clicks "Run" in the GitLab UI after deciding a retrain is warranted (e.g.
+# after reading a drift-check CronJob failure).
+train:
+  stage: train
+  image: python:3.12-slim
+  <<: *aws_auth
+  script:
+    - apt-get update && apt-get install -y --no-install-recommends make curl unzip
+    # Same pinned aws-cli / kubectl installs as the `deploy` job.
+    - curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip && unzip -q awscliv2.zip && ./aws/install
+    - curl -sL "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
+    - curl -sSL https://install.python-poetry.org | python3 -
+    - export PATH="/root/.local/bin:$PATH"
+    - poetry -C core_ml install --no-interaction
+    - export AWS_ACCOUNT_ID=$(poetry -C core_ml run python -c "import boto3; print(boto3.client('sts').get_caller_identity()['Account'])")
+    - poetry -C core_ml run dvc remote modify s3remote url "s3://hotel-mlops-artifacts-production-${AWS_ACCOUNT_ID}/dvc-store"
+    # A fresh runner has no dataset: `dvc repro` (inside `make train`) only
+    # rebuilds outputs from inputs it can already see.
+    - poetry -C core_ml run dvc pull data/hotel_bookings.csv
+    # mlflow-service is ClusterIP (no unauthenticated public endpoint), so the
+    # runner reaches it the way an operator does: a port-forward through the
+    # EKS API, authorised by this job's OIDC role.
+    - aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
+    - kubectl port-forward -n hotel-mlops svc/mlflow-service 5000:5000 > /tmp/port-forward.log 2>&1 &
+    - |
+      for i in $(seq 1 30); do
+        curl -sf http://localhost:5000/health >/dev/null && break
+        sleep 1
+      done
+      curl -sf http://localhost:5000/health >/dev/null || (cat /tmp/port-forward.log && echo "MLflow port-forward never came up" && exit 1)
+    - export MLFLOW_TRACKING_URI=http://localhost:5000
+    - make train
+    - make promote
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
+      when: manual
+  allow_failure: true

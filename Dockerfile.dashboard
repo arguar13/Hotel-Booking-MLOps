@@ -1,0 +1,39 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    POETRY_VERSION=2.4.1
+
+WORKDIR /app
+
+# Optional local CA trust for machines where a corporate/AV proxy performs
+# TLS interception on outbound HTTPS - see Dockerfile (api) for the full
+# rationale. No-op everywhere the override file isn't provided.
+COPY docker/local-ca-placeholder.crt docker/local-c[a].crt /tmp/local-ca/
+RUN sh -c 'for f in /tmp/local-ca/*; do [ -s "$f" ] && cp "$f" /usr/local/share/ca-certificates/local-ca.crt; done; update-ca-certificates; rm -rf /tmp/local-ca'
+ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+# Same Poetry that wrote poetry.lock: lock-version 2.1 needs Poetry >= 2.
+RUN pip install --no-cache-dir poetry==$POETRY_VERSION
+
+COPY core_ml/pyproject.toml core_ml/poetry.lock* ./
+RUN poetry config virtualenvs.create false \
+    && poetry install --only main --no-interaction --no-ansi --no-root
+
+COPY core_ml/ ./core_ml/
+
+# Unprivileged user - see Dockerfile (api) for why UID 1000 specifically.
+# STREAMLIT_* keep Streamlit's config/state inside the writable home dir
+# instead of the read-only root filesystem the Kubernetes securityContext
+# enforces (kubernetes/base/dashboard.yaml).
+RUN useradd --create-home --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+ENV HOME=/home/appuser \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "core_ml/dashboard/app.py", "--server.port=8501", "--server.address=0.0.0.0"]

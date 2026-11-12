@@ -1,0 +1,176 @@
+data:
+  raw_data_path: "data/hotel_bookings.csv"
+  processed_data_path: "data/processed_hotel_bookings.csv"
+  # ~1000-row, DVC-tracked, deterministic sample of the raw dataset used for
+  # fast end-to-end local runs (see scripts/make_toy_dataset.py). Enable with
+  # HOTEL_MLOPS_USE_TOY_DATA=true (or `make train-toy` / `make data-toy`).
+  toy_raw_data_path: "data/toy/hotel_bookings_toy.csv"
+  toy_processed_data_path: "data/toy/processed_hotel_bookings_toy.csv"
+  toy_sample_size: 1000
+  valid_classes_min_count: 10
+  # Optional upper bound on the arrival year used for training - a training
+  # period, which every production model has whether or not it is written
+  # down. Left empty the whole dataset is used.
+  #
+  # It is also what makes an honest drift backtest possible: this dataset
+  # spans 2015-07 to 2017-08 and its booking mix genuinely shifts towards
+  # online travel agencies over that period, so training with
+  # train_max_year: 2016 and then replaying 2017 through the API
+  # (scripts/replay_bookings.py) measures the monitor against drift that
+  # actually happened, rather than against injected noise.
+  train_max_year: null
+
+# The model's input contract: an allowlist, not "every column except the
+# target". A column only belongs here if it is known *at the moment a booking
+# is created*, which is when the segment is needed (pricing, demand
+# forecasting). tests/test_features.py fails if a column listed under
+# "Deliberately excluded" below ever gets added back.
+#
+# Deliberately excluded:
+#   - distribution_channel: recorded by the same channel-of-record system as
+#     market_segment and almost a coarser copy of it (Direct->Direct,
+#     Corporate->Corporate, TA/TO->the TA segments). It alone predicts the
+#     segment for ~77% of bookings, so a model using it mostly learns a lookup.
+#   - agent, company (the raw ids): identifiers, not quantities - a median or
+#     a mean of them means nothing, and a single agent id pins the segment for
+#     ~89% of bookings. Only their presence is used (presence_flags below).
+#   - reservation_status, reservation_status_date, is_canceled: outcomes of
+#     the booking, only known after it happened (target leakage).
+#   - assigned_room_type, booking_changes: set or accumulated after booking
+#     time, up to check-in.
+#   - arrival_date_year: the model is always applied to years it never saw,
+#     so this can only extrapolate. Still used to cut the training period.
+features:
+  numeric:
+    - lead_time
+    - arrival_date_day_of_month
+    - stays_in_weekend_nights
+    - stays_in_week_nights
+    - adults
+    - children
+    - babies
+    - is_repeated_guest
+    - previous_cancellations
+    - previous_bookings_not_canceled
+    - days_in_waiting_list
+    - adr
+    - required_car_parking_spaces
+    - total_of_special_requests
+  # Encoded as sin/cos inside the model pipeline (src/features.py), so week 53
+  # sits next to week 1 and December next to January.
+  cyclical:
+    month: 12
+    arrival_date_week_number: 53
+  # NaN means "booked without a travel agent / company", which is exactly the
+  # information worth keeping: becomes has_agent / has_company.
+  presence_flags:
+    - agent
+    - company
+  categorical:
+    - hotel
+    - meal
+    - country
+    - reserved_room_type
+    - deposit_type
+    - customer_type
+
+model:
+  target_column: "market_segment"
+  # Three-way split, not two-way: Optuna tunes against validation_size only.
+  # test_size is set aside before tuning starts and is touched exactly once,
+  # for the final quality-gate score and the monitoring baseline - so that
+  # figure is an honest estimate of production performance rather than a
+  # hyperparameter-selection score wearing a "held-out" label.
+  test_size: 0.2
+  validation_size: 0.2
+  random_state: 42
+  # Each trial fits a RandomForest on ~50k rows (tens of seconds on a laptop).
+  # Trial 0 is always the compact baseline in train.py (BASELINE_PARAMS), so
+  # the tuned model can never be worse than it on validation. The sampler is
+  # seeded with random_state, so the same value explores the same trials.
+  n_trials_optuna: 8
+  # Size budget for the pickled model, in MB. It is a serving constraint, not
+  # a modelling preference. Measured in the API image under a cgroup memory
+  # limit: the process uses ~155 MiB before loading a model, and loading the
+  # current 141 MB forest peaks at 428 MiB (~1.9x its size), so a model at
+  # the 200 MB budget peaks around 550 MiB, under the API's 768Mi limit
+  # (kubernetes/base/api.yaml). The unconstrained forest this replaced was
+  # 554 MB and peaked at 1.2 GiB: no 512Mi or 768Mi pod could load it.
+  # Optuna prunes candidates projected above the budget, and the quality gate
+  # below rejects a final model that exceeds it.
+  max_model_size_mb: 200
+  # Also refit on every arrival year but the last and score the last one,
+  # logged as temporal_f1_score / temporal_f1_macro - see train.py.
+  temporal_backtest: true
+  # Quality gate: a trained model is only ever registered as a promotion
+  # *candidate* when its weighted F1 on the held-out test split meets this
+  # bar (and it fits max_model_size_mb above). A run that misses either is
+  # still logged to MLflow for audit, but the run fails loudly (non-zero
+  # exit), gets no registry version and is never considered by
+  # promote_model.py. Absolute, not relative - it is the floor a model must
+  # clear regardless of how the currently-served version is doing.
+  min_f1_threshold: 0.60
+
+  # Promotion (core_ml/src/promote_model.py), the step *after* train.py:
+  # train.py applies the quality gate and registers a version, but no
+  # longer moves the registry alias itself - that decision now requires
+  # beating the model already serving, not just clearing an absolute floor.
+  # Passing min_f1_threshold and still being worse than production is
+  # exactly the gap an absolute-only gate cannot see, and exactly what let
+  # a retrain triggered by drift promote a regression with nobody having
+  # compared the two.
+  #
+  # canary_tolerance allows the challenger to score up to this much *below*
+  # the champion's weighted F1 and still promote - a small negative number,
+  # not zero, because requiring a strict improvement on every retrain would
+  # reject a model that recovered most but not all of a real regression,
+  # which is still worth shipping. Both figures are read from each model
+  # version's own logged reference profile (build_reference_profile's
+  # performance.f1_weighted), not from a live re-scoring pass - see
+  # promote_model.py's module docstring for why that trade-off was made
+  # consciously rather than overlooked.
+  canary_tolerance: -0.01
+  registry_name: "HotelSegmentClassifier"
+  # MLflow Model Registry alias (not the deprecated stages API) the serving
+  # API reads from via `models:/<registry_name>@<registry_alias>`.
+  registry_alias: "staging"
+
+mlflow:
+  experiment_name: "hotel_market_segmentation"
+  # The host port docker-compose publishes MLflow on (5050, not 5000 - see
+  # docker-compose.yml). MLFLOW_TRACKING_URI overrides it in every entrypoint.
+  tracking_uri: "http://localhost:5050"
+
+# Drift monitoring. Read by the CronJob in kubernetes/base/drift-monitor-cronjob.yaml
+# (src/monitoring/drift_check.py), never by the API. See that module's
+# docstring for how the check itself works (a per-feature z-test against the
+# mean/std recorded at training time).
+monitoring:
+  experiment_name: "hotel_market_segmentation_monitoring"
+
+  # The trailing window each run evaluates. Daily is a reasonable cadence for
+  # a small service: enough traffic accumulates to say something, without
+  # running the check so often that every run competes for the same
+  # database connections as the API.
+  window_hours: 24
+
+  # Below this many predictions in the window, the run reports SKIPPED rather
+  # than "no drift" - the distinction matters, because "we could not tell"
+  # and "we checked and it is fine" call for very different responses.
+  min_predictions: 500
+  # Hard cap on rows pulled into memory, so a traffic spike cannot make this
+  # job OOM instead of just taking a bit longer.
+  max_rows: 200000
+
+  # Significance level for the per-feature z-test: a feature's batch mean is
+  # flagged when its two-sided p-value drops below this. 0.05 is the common
+  # default; lower it (e.g. 0.01) if the check fires too often on noise.
+  alpha: 0.05
+
+  # A confirmed ALERT exits non-zero, so the Job shows as Failed and whatever
+  # already watches Kubernetes job failures sees it - the same "fail loudly"
+  # posture as the training quality gate, rather than a new alerting channel
+  # this project would have to own. The check only ever reports; nothing
+  # retrains or promotes automatically - see core_ml/src/promote_model.py for
+  # that decision.
+  fail_on_alert: true

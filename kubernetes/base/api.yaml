@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: hotel-mlops
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      serviceAccountName: api-sa
+      # UID 1000 is the `appuser` baked into the image (see Dockerfile).
+      # runAsNonRoot makes the kubelet refuse to start the pod at all if a
+      # future image regresses to running as root.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          # Tag set per-overlay via `kustomize edit set image` (CI's
+          # `deploy` job writes the freshly-built $IMAGE_TAG here, then
+          # runs `kubectl apply -k` - see .gitlab-ci.yml).
+          image: hotel-mlops-api:local
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # A pod with no limit can starve its node's other workloads under
+          # load, and one with no request leaves the scheduler guessing.
+          # Memory is sized from measurements in this image under a cgroup
+          # limit, together with the model size budget in
+          # core_ml/config/config.yaml (max_model_size_mb: 200): ~155 MiB
+          # before loading a model, and loading peaks at ~1.9x the pickled
+          # size (428 MiB for the current 141 MB forest), so a model at the
+          # budget peaks around 550 MiB, under the 768Mi limit.
+          resources:
+            requests:
+              cpu: "150m"
+              memory: "512Mi"
+            limits:
+              cpu: "500m"
+              memory: "768Mi"
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: mlops-secrets
+            - configMapRef:
+                name: mlops-config
+          # The root filesystem is read-only, so give the two paths that
+          # genuinely need to be written an ephemeral volume each: MLflow
+          # downloads the model artifact from S3 into a temp dir on startup,
+          # and its client keeps a small cache under $HOME.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: home
+              mountPath: /home/appuser
+          # Readiness and liveness answer different questions, so they point at
+          # different endpoints. /ready is 503 until a model is actually loaded,
+          # which keeps a replica out of the Service until it can serve real
+          # predictions - during a rollout, mlflow and api restart together, so
+          # the api is briefly up with no model. /health only reports that the
+          # process is alive: a missing model must not restart the container,
+          # because the background loader is already retrying and a restart
+          # would just reset that progress.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: home
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+  namespace: hotel-mlops
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: LoadBalancer

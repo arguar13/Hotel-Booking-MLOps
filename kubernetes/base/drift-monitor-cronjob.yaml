@@ -1,0 +1,103 @@
+# The drift check, on a schedule.
+#
+# A CronJob rather than a workflow engine: this is one container, run once a
+# day, with no fan-out and no inter-task dependencies. Airflow, Argo Workflows
+# or Step Functions would each add a control plane to operate, upgrade and
+# secure in exchange for scheduling semantics Kubernetes already has natively -
+# the same reasoning that kept Kustomize instead of Helm for this repo's own
+# manifests.
+#
+# It is also the first workload here that is *not* a long-running service, which
+# is why it is the workload that required Dockerfile.jobs to exist at all.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: drift-check
+  namespace: hotel-mlops
+spec:
+  # 04:00 UTC daily: after the overnight reconciliation window that supplies
+  # ground-truth labels for the previous day's predictions, and before the
+  # working day it would otherwise compete with for RDS connections.
+  schedule: "0 4 * * *"
+  timeZone: "Etc/UTC"
+
+  # Forbid, not Allow: two checks reading overlapping windows would log two
+  # runs for the same period into MLflow for no reason.
+  concurrencyPolicy: Forbid
+
+  # If the controller was down when the schedule fired, only start a missed run
+  # if it is still fresh. A stale window evaluated hours late produces a verdict
+  # about a period nobody can act on any more.
+  startingDeadlineSeconds: 3600
+
+  successfulJobsHistoryLimit: 3
+  # Kept deeper than the successful ones on purpose: a failed run is evidence,
+  # and `kubectl logs` on a pod that has already been garbage-collected is the
+  # most common reason an alert cannot be investigated the next morning.
+  failedJobsHistoryLimit: 5
+
+  jobTemplate:
+    spec:
+      # No retries. A failure here is either a genuine ALERT (exit 1 by design -
+      # see config.yaml's fail_on_alert) or a real defect; retrying the first
+      # would log the same alert three times and reset nothing, and retrying the
+      # second just hides it.
+      backoffLimit: 0
+      activeDeadlineSeconds: 1800
+      # Keep finished pods around for a day so their logs survive the run.
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: jobs-sa
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: drift-check
+              # Tag set per-overlay via `kustomize edit set image`, exactly like
+              # the other images - CI's `build_push` job writes the
+              # freshly-built $IMAGE_TAG here (see .gitlab-ci.yml's `deploy` job).
+              image: hotel-mlops-jobs:local
+              imagePullPolicy: Always
+              command: ["python", "-m", "src.monitoring.drift_check"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              envFrom:
+                # The exact same ConfigMap and Secret the api Deployment
+                # consumes, so "where the monitoring store is" and "where MLflow
+                # is" have one definition in Git rather than one per workload.
+                - secretRef:
+                    name: mlops-secrets
+                - configMapRef:
+                    name: mlops-config
+              # Bounded on purpose: the job pulls a capped window into a
+              # DataFrame, so a traffic spike fails the job with a clear
+              # reason instead of getting the pod evicted.
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "1Gi"
+              # Read-only root filesystem: MLflow stages the reference profile
+              # it downloads through a temp dir, and keeps its client cache
+              # under $HOME.
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                - name: home
+                  mountPath: /home/appuser
+          volumes:
+            - name: tmp
+              emptyDir: {}
+            - name: home
+              emptyDir: {}

@@ -1,0 +1,7 @@
+# Declared as a plain resource, applied by `kubectl apply -k` (or CI's
+# `deploy` stage) like everything else in this directory - so the namespace
+# itself is traceable to a commit, the same as any other manifest here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hotel-mlops

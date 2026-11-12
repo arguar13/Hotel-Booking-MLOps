@@ -1,0 +1,41 @@
+# Patterns are matched from the build-context root, so a bare `mlruns/` only
+# excluded ./mlruns and let core_ml/mlruns (local MLflow runs) ride into the
+# dashboard image through its `COPY core_ml/`. `**/` makes them apply at any
+# depth.
+.git
+.gitignore
+**/venv/
+**/env/
+**/.venv/
+**/.env
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/mlruns/
+**/mlartifacts/
+**/mlflow.db
+**/run_id.txt
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+**/.coverage
+**/htmlcov/
+**/tests/
+.dvc/
+.dvcignore
+Dockerfile*
+docker-compose.yml
+
+# Datasets and DVC state - never needed inside an image build; the
+# raw/processed CSVs alone are tens of MB and would otherwise bloat every
+# build context.
+core_ml/data/
+core_ml/.dvc/
+
+# Local documentation, infrastructure code and CI config: not needed by any
+# image.
+*.docx
+terraform/
+kubernetes/
+.gitlab-ci.yml

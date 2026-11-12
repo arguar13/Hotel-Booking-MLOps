@@ -1,0 +1,387 @@
+*Read this in other languages: [Español](README_es.md)*
+
+# Hotel Booking Market Segmentation: MLOps Pipeline
+
+[![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)](core_ml/pyproject.toml)
+[![CI/CD](https://img.shields.io/badge/CI%2FCD-GitLab%20CI-fc6d26?logo=gitlab&logoColor=white)](.gitlab-ci.yml)
+[![Docker](https://img.shields.io/badge/container-Docker-2496ED?logo=docker&logoColor=white)](Dockerfile)
+[![Kubernetes](https://img.shields.io/badge/orchestration-Kubernetes%20(EKS)-326CE5?logo=kubernetes&logoColor=white)](kubernetes/base)
+[![Terraform](https://img.shields.io/badge/IaC-Terraform-7B42BC?logo=terraform&logoColor=white)](terraform)
+[![MLflow](https://img.shields.io/badge/tracking-MLflow-0194E2?logo=mlflow&logoColor=white)](core_ml/src/train.py)
+[![Linting: Ruff](https://img.shields.io/badge/lint-Ruff-D7FF64?logo=ruff&logoColor=black)](https://github.com/astral-sh/ruff)
+
+## The problem
+
+Hotels take bookings through several channels (direct, online travel
+agencies, corporate accounts, groups) and a booking's **market segment**
+drives pricing strategy and demand forecasting downstream. Getting that
+segment right, and getting it right *consistently* as booking patterns shift
+over a season, is what makes this a genuine MLOps problem rather than a
+one-off notebook: the interesting part isn't fitting a classifier once, it's
+operating it: tracking which version is serving, catching when the world
+it was trained on stops matching the world it's scoring, and having a
+repeatable, reviewable path from a new training run to a production alias
+flip.
+
+This project builds that whole loop end to end: a scikit-learn classifier
+(a class-weighted RandomForest + Optuna for hyperparameter search, fed only
+what is known at the moment a booking is created) trained on the classic
+[hotel booking demand dataset](https://www.sciencedirect.com/science/article/pii/S2352340918315191),
+served behind a FastAPI endpoint, versioned in an MLflow Model Registry, and
+watched by a scheduled statistical check for data drift, all wired together
+with the pieces a small team actually needs to run this in AWS: containerized
+services, Infrastructure as Code, a CI/CD pipeline, and Kubernetes manifests
+that describe the running system declaratively.
+
+## Architecture
+
+```mermaid
+graph TD
+    subgraph "Local dev (docker-compose)"
+        DEV[api / dashboard / mlflow / db / localstack]
+    end
+
+    subgraph "CI - GitLab CI (.gitlab-ci.yml)"
+        L[lint_test: ruff + pytest] --> B[build_push: docker build + push to ECR]
+        B --> DPL[deploy: kubectl apply -k]
+        TR["train (manual): train + quality gate + promote"]
+    end
+
+    subgraph "AWS (Terraform)"
+        subgraph "VPC - 2 AZ, 1 NAT gateway"
+            EKS[EKS cluster - 1 managed node group]
+            RDS[(RDS PostgreSQL - single instance<br/>MLflow store + prediction log)]
+        end
+        S3[(S3 bucket - model artifacts + DVC data)]
+        ECR[(ECR - api, dashboard, jobs images)]
+    end
+
+    subgraph "Inside the cluster (kubernetes/)"
+        API[api Deployment]
+        MLF[mlflow Deployment<br/>official ghcr.io/mlflow/mlflow image]
+        DASH[dashboard Deployment]
+        CRON["drift-check CronJob<br/>daily, src/monitoring/drift_check.py"]
+    end
+
+    DPL -->|kubectl apply -k| EKS
+    EKS --> API
+    EKS --> MLF
+    EKS --> DASH
+    EKS --> CRON
+    API -->|reads model| MLF
+    MLF -->|backend store| RDS
+    MLF -->|artifacts| S3
+    API -->|logs predictions + labels| RDS
+    CRON -->|reads reference profile| S3
+    CRON -->|reads recent predictions| RDS
+    TR -->|trains, logs run| MLF
+    B --> ECR
+```
+
+### Why it's built this way
+
+**MLflow as the single source of truth for models.** The API never loads a
+local `model.joblib`; it resolves `models:/HotelSegmentClassifier@staging`
+against the registry on startup and on a refresh interval. That means "what's
+serving in production" is always an answer the registry can give, not a file
+that happens to be sitting in an image.
+
+**A quality gate, then a canary comparison, as two separate steps.**
+`train.py` only checks a candidate against absolute bars: an F1 floor
+(`min_f1_threshold`) and a model size budget (`max_model_size_mb`), and only
+a run that clears both gets a registry version. `promote_model.py`
+is the second, independent gate: it compares the candidate's F1 against
+whatever is currently aliased `staging` and only moves the alias if the
+candidate isn't meaningfully worse (`canary_tolerance`). Splitting these two
+concerns means a model can fail loudly for being simply bad, or separately for
+being a regression versus what's already live: two different failure modes
+that call for different responses.
+
+**A statistical, batch drift check instead of a streaming pipeline.** Every
+training run logs a small reference profile (mean/standard deviation per
+numeric feature, computed on the data the model was actually fit on) as an
+MLflow artifact. A daily `CronJob` pulls a recent window of logged
+predictions from Postgres and runs a one-sample z-test per feature against
+that baseline, logging the verdict back to MLflow. This is the right level of
+machinery for the traffic volumes involved: no message bus, no dedicated
+streaming infrastructure to operate; just a scheduled job whose input is
+already durable in a database this project runs anyway. A human reads the
+result and decides whether a retrain is warranted; nothing retrains or
+redeploys itself.
+
+**`kubectl apply -k` in CI instead of a GitOps controller.** The `deploy`
+stage builds fresh images, tags the Kustomize overlay, and applies it
+directly to the cluster. For a single-environment, single-team deployment
+this keeps the entire release path inside one pipeline definition, with one
+tool (`kustomize`) to reason about, rather than introducing a second
+control plane whose job is to reconcile what the first one already applied.
+
+**One managed node group, one RDS instance, one NAT gateway.** The VPC spans
+two availability zones for genuine subnet isolation, but the compute and
+database layers are sized for what this workload needs: a couple of
+`t3.medium` nodes running the API, MLflow, the dashboard, and the drift job,
+and a single-instance Postgres database backing both the MLflow tracking
+store and the prediction log. Scaling any of these up is a Terraform variable
+change, not an architecture change.
+
+**A Kubernetes Secret for the database password, populated once by hand.**
+Terraform generates the RDS password (`random_password`) and the operator
+copies it into a plain `kubectl create secret`, a small, explicit manual
+step that keeps the credential out of both the Git history and the Terraform
+state's more widely-read outputs, without requiring a secrets-management
+service to be provisioned and IAM-wired just to hand one password to one
+Deployment.
+
+## Tech stack
+
+| Layer | Choice |
+|---|---|
+| Model | scikit-learn `RandomForestClassifier` (`class_weight="balanced_subsample"`), Optuna (seeded TPE) for hyperparameter search |
+| Data validation | Pandera schemas (`core_ml/src/data_contracts.py`); fail fast before an expensive training run starts |
+| Data versioning | DVC, backed by the same S3 bucket MLflow uses for artifacts |
+| Experiment tracking / registry | MLflow (server + Model Registry, alias-based) |
+| Serving | FastAPI + Uvicorn, structured JSON logging (`structlog`) |
+| Monitoring | Custom prediction/label logger to Postgres (`api/monitoring.py`) + a scheduled z-test drift check |
+| Dashboard | Streamlit |
+| Containers | Docker (one image per workload: `Dockerfile`, `Dockerfile.dashboard`, `Dockerfile.jobs`) |
+| Local stack | Docker Compose (Postgres, LocalStack for S3, MLflow, API, dashboard) |
+| Infrastructure as Code | Terraform (VPC, EKS, RDS, S3, ECR, IAM, OIDC federation with GitLab) |
+| Orchestration | Kubernetes on EKS, manifests managed with Kustomize (`base` + `production` overlay) |
+| CI/CD | GitLab CI (`lint_test` → `build_push` → `deploy`, plus a manual `train` stage) |
+| Quality gates | Ruff, mypy, pytest, pre-commit |
+
+## Running locally
+
+Requires Docker and Docker Compose.
+
+```bash
+docker compose up --build
+```
+
+This starts Postgres, a local S3 emulator (LocalStack), MLflow (backed by
+Postgres + S3), the FastAPI serving app, and a Streamlit dashboard:
+
+- API: http://localhost:8000/docs
+- MLflow UI: http://localhost:5050
+- Dashboard: http://localhost:8501
+
+The API reports `model_loaded: false` on `/health` until a model has been
+trained and registered; see the next section.
+
+## Training
+
+Both `api/` and `core_ml/` are separate Poetry projects.
+
+```bash
+cd core_ml
+poetry install
+poetry run dvc pull                       # pulls the tracked dataset (real S3 remote)
+poetry run python -m src.train            # MLflow at http://localhost:5050 by default
+```
+
+`dvc pull` talks to the real AWS S3 remote. To stay fully local, copy the
+public [hotel booking demand](https://www.sciencedirect.com/science/article/pii/S2352340918315191)
+CSV to `core_ml/data/hotel_bookings.csv` instead and check that its
+`md5sum` matches the hash in `core_ml/data/hotel_bookings.csv.dvc`
+(`5bf588c5...`) - DVC then treats it exactly like a pulled copy.
+`make train-toy` runs the same loop on a 1,000-row sample in seconds.
+
+Training runs a scikit-learn pipeline (feature derivation + a tuned,
+class-weighted RandomForest) with Optuna, logs the run (params, weighted and
+macro F1, a per-class report, the feature list, the model itself, and a
+small reference profile used later for drift checking) to MLflow, and writes
+the run id to `core_ml/run_id.txt`. A run that doesn't clear
+`model.min_f1_threshold` or `model.max_model_size_mb` (see
+`core_ml/config/config.yaml`) is still logged for audit, but it is never
+registered, so it can never be promoted.
+
+## What the model is allowed to see
+
+The segment is needed when a booking is created (pricing, demand
+forecasting), so the model only receives columns known at that moment. The
+allowlist lives in `core_ml/config/config.yaml` (`features:`), and
+`core_ml/tests/test_features.py` fails if an excluded column comes back.
+
+| Excluded | Why |
+|---|---|
+| `distribution_channel` | Recorded with the label and nearly a coarser copy of it - on its own it predicts the segment for ~77% of bookings |
+| `agent`, `company` (raw ids) | Identifiers, not quantities; one agent id pins the segment for ~89% of bookings. Only their *presence* is used (`has_agent`, `has_company`) - NaN means "no agent/company" |
+| `reservation_status`, `reservation_status_date`, `is_canceled` | Outcomes, only known after the booking (target leakage) |
+| `assigned_room_type`, `booking_changes` | Set or accumulated after booking time |
+| `arrival_date_year` | The model is always applied to years it never saw; still used to cut the training period |
+
+`month` and `arrival_date_week_number` are encoded as sin/cos pairs so the
+year boundary is continuous. All derived features are computed inside the
+logged scikit-learn pipeline, so the API sends raw booking fields and cannot
+diverge from training.
+
+Class imbalance is handled by `class_weight="balanced_subsample"` alone, with
+no resampling: oversampling methods such as SMOTE interpolate between
+one-hot-encoded rows (producing fractional categories), and combining them
+with class weights would correct the imbalance twice.
+
+## How the model is evaluated
+
+- **Three-way stratified split (60/20/20).** Optuna scores candidates on the
+  validation split only; the test split is used once, for the final numbers.
+- **A compact baseline is always a candidate.** Trial 0 is the smallest
+  configuration in the search space (100 trees, leaves of at least 3
+  bookings), so tuning can only replace it with a configuration that scores
+  better on validation (`val_f1_baseline_trial` vs `val_f1_best`).
+- **The model has to fit the pod that serves it.** Optuna prunes any
+  candidate whose size, projected to the final refit on train+val, exceeds
+  `max_model_size_mb` (200 MB), and the quality gate rejects a final model
+  above it (`model_size_mb` is logged on every run).
+- **A naive baseline travels with every run.** Always predicting the most
+  frequent segment scores 0.59 accuracy but 0.106 macro F1 - which is why
+  accuracy is not the headline metric here (`baseline_f1_*`).
+- **Weighted and macro F1**, a per-class report, the confusion matrix and a
+  one-vs-rest ROC AUC per segment are logged to MLflow on every run.
+- **Temporal backtest.** The chosen configuration is refit on 2015-2016 and
+  scored on 2017 (`temporal_f1_*`): the estimate for bookings the model has
+  never seen, after the channel mix has moved.
+
+Full-dataset run (`n_trials_optuna: 8`):
+
+| | Weighted F1 | Macro F1 |
+|---|---|---|
+| Most-frequent baseline (test) | 0.439 | 0.106 |
+| Validation: baseline trial -> best | 0.847 -> 0.847 | - |
+| **Test split (random, stratified)** | **0.855** | **0.818** |
+| **2017, trained on 2015-2016** | **0.769** | **0.653** |
+
+The gap between the last two rows is the reason the drift check below
+exists. Tuning did not beat the compact baseline on validation this time
+(one of the eight trials was pruned for size), so the shipped model is
+that baseline: 100 trees, `max_depth=30`, `min_samples_leaf=3`,
+`max_features=0.5`, 141 MB pickled.
+
+**Why there is a size budget.** An earlier version searched over fully grown
+trees and shipped a 554 MB forest. Loaded in the API image under a cgroup
+memory limit, it peaked at 1.2 GiB, so the 512Mi pod could never have
+started. Requiring leaves of at least 2-3 bookings cut the model to a
+quarter of the size for a small loss on the random split (weighted F1 0.866
+-> 0.855, macro 0.834 -> 0.818). The current model peaks at 428 MiB (~155 MiB
+of runtime plus ~1.9x the model) and predicts a single booking in ~38 ms on a
+laptop CPU, against 67 ms before. On the following year it actually does
+better (2017 macro F1 0.617 -> 0.653), consistent with the fully grown trees
+fitting 2015-2016 more closely than it generalised.
+
+## Promoting a model to champion
+
+A registered model version isn't served until it's explicitly promoted:
+
+```bash
+poetry run python -m src.promote_model --run-id "$(cat run_id.txt)"
+```
+
+`promote_model.py` compares the candidate's weighted F1 against whatever
+model is currently serving under the `staging` alias (the "champion") and
+only moves the alias if the candidate isn't worse than
+`model.canary_tolerance` allows. The very first promotion always goes
+through, since there's nothing yet to compare against. Every promotion tags
+the new version with the one it replaced, so a bad promotion can be undone
+with:
+
+```bash
+poetry run python -m src.promote_model --rollback
+```
+
+`make train` / `make promote` wrap both steps end to end; run `make help` for
+the full list of targets.
+
+## Monitoring for drift
+
+`core_ml/src/monitoring/drift_check.py` runs a lightweight, well-scoped
+check: at training time it records the mean and standard deviation of every
+numeric feature; on a schedule (daily, via the `drift-check` CronJob) it
+pulls a recent batch of logged predictions from Postgres and runs a
+one-sample z-test per feature against that baseline. A feature whose batch
+mean has drifted many standard errors from what training saw gets flagged.
+The check only logs its verdict to MLflow and to stdout; it never retrains
+or redeploys anything by itself. Deciding to retrain, and reviewing the
+outcome, stays a human's job (`make train` + `make promote`, or the manual
+`train` stage in `.gitlab-ci.yml`).
+
+Try the whole loop locally:
+
+```bash
+make replay          # replays real 2016 bookings through /predict + /feedback
+make drift-check      # runs the same check the CronJob runs, from the same image
+```
+
+## Deploying
+
+> **Deployed on a real AWS account.** This stack has been deployed end to end on AWS: Terraform provisioned the infrastructure, the image was pushed to ECR and the service ran on EKS, with MLflow backed by RDS and S3. It was then torn down with `terraform destroy` to avoid ongoing costs (EKS, RDS and the NAT Gateway bill by the hour), so there is no live endpoint. The steps below are the ones used for that deployment.
+
+### 1. Infrastructure (Terraform)
+
+```bash
+cd terraform
+terraform init -backend-config="bucket=<your-tfstate-bucket>" \
+                -backend-config="key=hotel-mlops/terraform.tfstate" \
+                -backend-config="region=us-east-1"
+terraform apply
+```
+
+This provisions a VPC (2 availability zones, 1 NAT gateway), an EKS cluster
+with a single managed node group, a single-instance RDS Postgres database,
+an S3 bucket for MLflow/DVC artifacts, ECR repositories, and the IAM role
+GitLab CI assumes via OIDC to build, push, and deploy. The stack is designed
+to be brought up on demand for a demo or a review and torn down again with
+`terraform destroy` when it isn't needed.
+
+Once the cluster exists, create the one secret Terraform doesn't manage
+directly:
+
+```bash
+kubectl create namespace hotel-mlops
+kubectl create secret generic mlops-secrets \
+  --from-literal=POSTGRES_PASSWORD="$(terraform -chdir=terraform output -raw db_password)" \
+  -n hotel-mlops
+```
+
+### 2. Application (kubectl / kustomize)
+
+```bash
+kubectl apply -k kubernetes/overlays/production
+```
+
+`.gitlab-ci.yml`'s `deploy` stage runs the same command after building and
+pushing fresh images, so the cluster's state always reflects the last
+successful pipeline run on `main`.
+
+The API and the dashboard get public load balancers. MLflow does not: it has
+no authentication, and anyone who can reach it can move the registry alias
+the API serves from, so `mlflow-service` is `ClusterIP`. Reach it through
+the EKS API with your cluster credentials:
+
+```bash
+kubectl port-forward -n hotel-mlops svc/mlflow-service 5000:5000
+# UI at http://localhost:5000; for training/promotion:
+MLFLOW_TRACKING_URI=http://localhost:5000 make train promote
+```
+
+## Testing and quality
+
+```bash
+make lint    # ruff + mypy, both projects
+make test    # pytest, both projects
+make install # registers pre-commit hooks
+```
+
+These are the exact commands `.gitlab-ci.yml`'s `lint_test` stage runs and
+that `pre-commit` runs on every commit, so there's a single definition of
+"passing" shared by a laptop and CI.
+
+## Repository layout
+
+```
+api/            FastAPI serving app (Poetry project, own tests)
+core_ml/        Data pipeline, training, drift check, dashboard (Poetry project, own tests)
+terraform/      AWS infrastructure: VPC, EKS, RDS, S3, ECR, IAM
+kubernetes/     Kustomize manifests (base + production overlay)
+docker-compose.yml   Local stack: db, localstack (S3), mlflow, api, dashboard
+Dockerfile*     One image per workload: api, dashboard, jobs (core_ml batch code)
+.gitlab-ci.yml  lint_test -> build_push -> deploy -> train (manual)
+```

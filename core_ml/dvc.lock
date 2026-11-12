@@ -1,0 +1,56 @@
+schema: '2.0'
+stages:
+  clean_data:
+    cmd: python -m src.data_processing
+    deps:
+    - path: data/hotel_bookings.csv
+      hash: md5
+      md5: 5bf588c5a949443e021fb7c847d31b27
+      size: 16855599
+    - path: src/config_loader.py
+      hash: md5
+      md5: f62b6776d3836117d00b58a218d437e3
+      size: 1084
+    - path: src/data_contracts.py
+      hash: md5
+      md5: bb36a91bf211437de328b3e547d50f26
+      size: 4798
+    - path: src/data_processing.py
+      hash: md5
+      md5: 5df26843852b10349ee82ed5fb67ccbd
+      size: 4430
+    params:
+      config/config.yaml:
+        data.valid_classes_min_count: 10
+    outs:
+    - path: data/processed_hotel_bookings.csv
+      hash: md5
+      md5: f19901b7c6a49e08719419b356e6f1f6
+      size: 12050961
+  clean_data_toy:
+    cmd: python -m src.data_processing --toy
+    deps:
+    - path: data/toy/hotel_bookings_toy.csv
+      hash: md5
+      md5: e61fb7fe8eb1dec710ee621b075f0d6c
+      size: 144037
+    - path: src/config_loader.py
+      hash: md5
+      md5: f62b6776d3836117d00b58a218d437e3
+      size: 1084
+    - path: src/data_contracts.py
+      hash: md5
+      md5: bb36a91bf211437de328b3e547d50f26
+      size: 4798
+    - path: src/data_processing.py
+      hash: md5
+      md5: 5df26843852b10349ee82ed5fb67ccbd
+      size: 4430
+    params:
+      config/config.yaml:
+        data.valid_classes_min_count: 10
+    outs:
+    - path: data/toy/processed_hotel_bookings_toy.csv
+      hash: md5
+      md5: 44609e200e0db49f675fa279164b62ca
+      size: 136266
